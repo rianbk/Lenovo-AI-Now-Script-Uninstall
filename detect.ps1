@@ -132,8 +132,9 @@ try {
         $exitCode = 0
     }
 } catch {
-    $exitCode = 1
+    $exitCode = 0
     Write-Log "DETECTION FAILED: Unhandled exception during detection: $($_.Exception.Message)" "ERROR"
+    Write-Log "Defaulting to 'not detected' to avoid triggering remediation on script errors." "ERROR"
     if ($_.InvocationInfo?.PositionMessage) {
         Write-Log $_.InvocationInfo.PositionMessage "ERROR"
     }
