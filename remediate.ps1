@@ -9,12 +9,15 @@ $logFile = Join-Path $logFolder "Lenovo_AI_Now_Remediate.log"
 
 function Write-Log {
     param(
+        [Parameter(Position=0)]
         [string]$Message,
-        [ValidateSet("INFO","WARNING","ERROR","DEBUG")] [string]$Level = "INFO"
+        [Parameter(Position=1)]
+        [ValidateSet("INFO","WARNING","ERROR","DEBUG")] 
+        [string]$Level = "INFO"
     )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "$timestamp [$Level] $Message"
-    Write-Output $logEntry
+    Write-Host $logEntry
     Add-Content -Path $logFile -Value $logEntry
 }
 
@@ -249,8 +252,13 @@ function Remove-DirectoryWithRetry {
                     }
                     
                     Write-Log "Using robocopy to forcefully remove directory contents"
-                    $robocopyResult = & robocopy "$tempEmpty" "$Path" /MIR /R:0 /W:0 2>&1
+                    $robocopyOutput = & robocopy "$tempEmpty" "$Path" /MIR /R:0 /W:0 2>&1
                     Write-Log "DEBUG: Robocopy exit code: $LASTEXITCODE"
+                    if ($robocopyOutput) {
+                        foreach ($line in ($robocopyOutput | Select-Object -First 5)) {
+                            Write-Log "DEBUG: Robocopy output: $line"
+                        }
+                    }
                     
                     # Clean up temp directory
                     Remove-Item -Path $tempEmpty -Force -ErrorAction SilentlyContinue
@@ -378,17 +386,71 @@ function Get-UserProfileDirectories {
         }
 }
 
+function Resolve-UserProfileSid {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LocalPath,
+        [Parameter(Mandatory = $true)]
+        [string]$ProfileName
+    )
+
+    try {
+        $cimProfiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalPath -eq $LocalPath }
+        if ($cimProfiles) {
+            foreach ($cimProfile in $cimProfiles) {
+                if ($cimProfile.SID) {
+                    return $cimProfile.SID
+                }
+            }
+        }
+    } catch {
+        Write-Log "Resolve-UserProfileSid: CIM lookup failed for $LocalPath : $($_.Exception.Message)" "DEBUG"
+    }
+
+    try {
+        $profileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+        if (Test-Path -Path $profileListKey) {
+            $profileEntries = Get-ChildItem -Path $profileListKey -ErrorAction SilentlyContinue
+            foreach ($entry in $profileEntries) {
+                try {
+                    $profileData = Get-ItemProperty -Path $entry.PSPath -ErrorAction Stop
+                    if ($profileData.ProfileImagePath -and ($profileData.ProfileImagePath -ieq $LocalPath)) {
+                        return $entry.PSChildName
+                    }
+                } catch {
+                    # Ignore individual profile entry failures
+                }
+            }
+        }
+    } catch {
+        Write-Log "Resolve-UserProfileSid: Registry lookup failed for $LocalPath : $($_.Exception.Message)" "DEBUG"
+    }
+
+    try {
+        $ntAccount = New-Object System.Security.Principal.NTAccount($ProfileName)
+        $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($sid) {
+            return $sid
+        }
+    } catch {
+        # Fall through to null result
+    }
+
+    return $null
+}
+
 function Remove-UserData {
     param(
         [string[]]$AdditionalPaths = @()
     )
 
-    $profiles = Get-UserProfileDirectories
+    $userProfiles = Get-UserProfileDirectories
     $targets = @()
 
-    foreach ($profile in $profiles) {
-        $profilePath = $profile.FullName
-        $profileTargets = @(
+    foreach ($userProfile in $userProfiles) {
+        $profilePath = $userProfile.FullName
+        $userProfileTargets = @(
             (Join-Path -Path $profilePath -ChildPath 'AppData\Local\Lenovo\Lenovo AI Now'),
             (Join-Path -Path $profilePath -ChildPath 'AppData\Local\Lenovo\LenovoAI Now'),
             (Join-Path -Path $profilePath -ChildPath 'AppData\Local\Lenovo\AI Now'),
@@ -396,14 +458,11 @@ function Remove-UserData {
             (Join-Path -Path $profilePath -ChildPath 'AppData\Roaming\Lenovo\LenovoAI Now'),
             (Join-Path -Path $profilePath -ChildPath 'AppData\Roaming\Lenovo\AI Now')
         )
-        $targets += $profileTargets
+        $targets += $userProfileTargets
         
         # Clean user registry entries
-        $userSid = $null
-        try {
-            $userAccount = New-Object System.Security.Principal.NTAccount($profile.Name)
-            $userSid = $userAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
-            
+        $userSid = Resolve-UserProfileSid -LocalPath $profilePath -ProfileName $userProfile.Name
+        if ($userSid) {
             $userRegPaths = @(
                 "Registry::HKEY_USERS\$userSid\SOFTWARE\Lenovo\AI Now",
                 "Registry::HKEY_USERS\$userSid\SOFTWARE\Lenovo\Lenovo AI Now",
@@ -414,15 +473,15 @@ function Remove-UserData {
             foreach ($regPath in $userRegPaths) {
                 if (Test-Path -Path $regPath) {
                     try {
-                        Write-Log "Removing user registry key $regPath for user $($profile.Name)"
+                        Write-Log "Removing user registry key $regPath for user $($userProfile.Name)"
                         Remove-Item -Path $regPath -Recurse -Force -ErrorAction Stop
                     } catch {
                         Write-Log "Failed to remove user registry key $regPath : $($_.Exception.Message)"
                     }
                 }
             }
-        } catch {
-            Write-Log "Could not resolve SID for user $($profile.Name): $($_.Exception.Message)"
+        } else {
+            Write-Log "Could not resolve SID for user $($userProfile.Name) at $profilePath" "DEBUG"
         }
     }
 
@@ -446,11 +505,11 @@ function Remove-StartMenuShortcuts {
         'C:\Users\Public\Desktop'
     )
 
-    foreach ($profile in Get-UserProfileDirectories) {
+    foreach ($userProfile in Get-UserProfileDirectories) {
         $profileShortcuts = @(
-            (Join-Path -Path $profile.FullName -ChildPath 'AppData\Roaming\Microsoft\Windows\Start Menu'),
-            (Join-Path -Path $profile.FullName -ChildPath 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'),
-            (Join-Path -Path $profile.FullName -ChildPath 'Desktop')
+            (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Roaming\Microsoft\Windows\Start Menu'),
+            (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'),
+            (Join-Path -Path $userProfile.FullName -ChildPath 'Desktop')
         )
         $shortcutRoots += $profileShortcuts
     }
@@ -939,30 +998,43 @@ function Invoke-LenovoAiNowRemediation {
 }
 
 $exitCode = 0
+$intuneExitCode = 0
 try {
-    $exitCode = Invoke-LenovoAiNowRemediation
-    
+    $remediationResult = Invoke-LenovoAiNowRemediation
+    if ($null -ne $remediationResult -and $remediationResult -is [int]) {
+        $exitCode = $remediationResult
+    }
+
     # Log final status based on exit code
     switch ($exitCode) {
         0 { 
-            Write-Log -Level 'INFO' -Message "Script completed successfully with exit code $exitCode"
+            Write-Log "Script completed successfully with exit code 0" "INFO"
+            $intuneExitCode = 0
         }
         3010 { 
-            Write-Log -Level 'INFO' -Message "Script completed with exit code $exitCode (reboot recommended)"
+            Write-Log "Script completed with exit code 3010 (reboot recommended)" "INFO"
+            $intuneExitCode = 0
         }
         1603 { 
-            Write-Log "Script completed with exit code $exitCode (partial failure)" "WARNING"
+            Write-Log "Script completed with exit code 1603 (partial failure)" "WARNING"
+            $intuneExitCode = 1
         }
         default { 
-            Write-Log -Level 'ERROR' -Message "Script completed with unexpected exit code $exitCode"
+            Write-Log "Script completed with unexpected exit code $exitCode" "ERROR"
+            $intuneExitCode = 1
         }
     }
 } catch {
     $exitCode = 1
+    $intuneExitCode = 1
     Write-Log "REMEDIATION FAILED: Unhandled exception during remediation: $($_.Exception.Message)" "ERROR"
     if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
         Write-Log $_.InvocationInfo.PositionMessage "ERROR"
     }
 }
 
-exit $exitCode
+if ($intuneExitCode -ne $exitCode) {
+    Write-Log "Reporting Intune-compatible exit code $intuneExitCode (actual remediation result $exitCode)" "DEBUG"
+}
+
+exit $intuneExitCode
